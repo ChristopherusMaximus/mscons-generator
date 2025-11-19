@@ -18,9 +18,13 @@ import {
   Package,
   CheckCircle2,
   XCircle,
+  Info,
 } from "lucide-react";
 import JSZip from "jszip";
 import saveAs from "file-saver";
+
+// >>> Versions-Tag für Frontend-Anzeige
+const APP_VERSION = "2025-11-19-01";
 
 // ===== Fixed EDIFACT header fields =====
 const SENDER_ID = "9979383000006";
@@ -557,9 +561,20 @@ export default function MSCONSGenerator() {
 
   return (
     <div className="p-6 max-w-6xl mx-auto space-y-6">
-      <div className="flex items-center gap-3">
-        <Zap className="w-6 h-6" />
-        <h1 className="text-2xl font-semibold">MSCONS Generator</h1>
+      {/* Header + Version */}
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          <Zap className="w-6 h-6" />
+          <div>
+            <h1 className="text-2xl font-semibold">MSCONS Generator</h1>
+            <div className="text-xs text-muted-foreground flex items-center gap-1">
+              <span className="inline-flex items-center px-2 py-0.5 rounded-full border border-slate-300">
+                Version {APP_VERSION}
+              </span>
+              <span>Multi-MaLo · 15-min · Demo-Daten</span>
+            </div>
+          </div>
+        </div>
       </div>
 
       {/* Zeitraum & MaLo-Liste */}
@@ -599,6 +614,17 @@ export default function MSCONSGenerator() {
       {/* Pro-MaLo Einstellungen */}
       <Card className="shadow-sm">
         <CardContent className="p-6 space-y-4">
+          <div className="flex items-center justify-between gap-2">
+            <div className="text-sm font-medium">Pro-MaLo Einstellungen</div>
+            <div className="text-[11px] text-muted-foreground flex items-center gap-1">
+              <Info className="w-3 h-3" />
+              <span>
+                PV-Wetter &amp; Tagesform gelten immer für alle Erzeuger,
+                die im selben Schritt generiert werden.
+              </span>
+            </div>
+          </div>
+
           <div className="grid md:grid-cols-7 gap-2 text-sm font-medium">
             <div>MaLo</div>
             <div>Richtung</div>
@@ -709,10 +735,11 @@ export default function MSCONSGenerator() {
           </div>
           <div className="text-xs text-muted-foreground flex items-center gap-1">
             <Shuffle className="w-3 h-3" />
-            Leichte zufällige Abweichung je Intervall; tägliche Summe
-            wird auf Ziel-kWh normalisiert. Pro MaLo:{" "}
-            <strong>entweder</strong> Verbrauch (kWh/Jahr + SLP){" "}
-            <strong>oder</strong> Erzeugung (kWp, saison + Wetter).
+            <span>
+              Zufällige Abweichungen je Intervall; tägliche Summe wird
+              auf Ziel-kWh normalisiert. Verbrauch nutzt H0/G0/L0-SLP,
+              PV basiert auf kWp, Saison &amp; Wetter.
+            </span>
           </div>
         </CardContent>
       </Card>
@@ -726,8 +753,7 @@ export default function MSCONSGenerator() {
           {fallbackLinks.length > 0 && (
             <div className="mt-2">
               <div className="text-sm mb-1">
-                Falls der Browser den ZIP-Download blockt:
-                Einzellinks
+                Falls der Browser den ZIP-Download blockt: Einzellinks
               </div>
               <div className="grid gap-1">
                 {fallbackLinks.map((f, i) => (
@@ -780,12 +806,27 @@ export default function MSCONSGenerator() {
         </CardContent>
       </Card>
 
-      <div className="text-xs text-muted-foreground flex items-center gap-1">
-        <Sun className="w-3 h-3" />
-        Format: UNA vorhanden, UNB direkt anschließend, keine
-        Zeilenumbrüche zwischen Segmenten, UNT korrekt gezählt.
-        15-Min-Intervalle (DTM 163/164) über den gewählten Zeitraum.
+      <div className="text-[11px] text-muted-foreground flex flex-col gap-1">
+        <div className="flex items-center gap-1">
+          <Sun className="w-3 h-3" />
+          <span>
+            Format: UNA vorhanden, UNB direkt anschließend, keine
+            Zeilenumbrüche zwischen Segmenten, UNT korrekt gezählt.
+            15-Min-Intervalle (DTM 163/164) über den gewählten Zeitraum.
+          </span>
+        </div>
+        <div>
+          Hinweis: Nur Erzeuger, die im selben Generierungslauf
+          erstellt werden, teilen sich exakt dieselben Wetter- &
+          Saisonfaktoren (gleiche „Wettertage“ im Monat).
+        </div>
       </div>
     </div>
   );
+
+  function updateCfg(malo: string, patch: Partial<MaLoCfg>) {
+    setConfigs((list) =>
+      list.map((c) => (c.malo === malo ? { ...c, ...patch } : c))
+    );
+  }
 }
