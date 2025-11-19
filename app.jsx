@@ -19,12 +19,22 @@ import {
   CheckCircle2,
   XCircle,
   Info,
+  Loader2,
 } from "lucide-react";
 import JSZip from "jszip";
 import saveAs from "file-saver";
+import {
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+} from "recharts";
 
 // >>> Versions-Tag für Frontend-Anzeige
-const APP_VERSION = "2025-11-19-01";
+const APP_VERSION = "2025-11-19-02";
 
 // ===== Fixed EDIFACT header fields =====
 const SENDER_ID = "9979383000006";
@@ -83,7 +93,6 @@ function getPVSeasonFactor(date: Date) {
   return PV_SEASON_FACTORS[m] ?? 0.5;
 }
 
-// ===== SLP Shapes (normalized per day, later scaled) =====
 function gaussian(x: number, mu: number, sigma: number) {
   return Math.exp(-((x - mu) ** 2) / (2 * sigma ** 2));
 }
@@ -183,6 +192,34 @@ function makePVProfile(
   return vals;
 }
 
+// PV-Tagesfaktoren (Saison + Wetter) – zentral, damit Generator & Preview identisch sind
+function computePvDayScales(startBase: Date, days: number): number[] {
+  const weatherRand = rnd(2025);
+  const pvDayScales: number[] = [];
+  for (let d = 0; d < days; d++) {
+    const dayDate = new Date(startBase.getTime() + d * 24 * 3600 * 1000);
+    const seasonFactor = getPVSeasonFactor(dayDate);
+    const r1 = weatherRand();
+    const r2 = weatherRand();
+    let weatherFactor: number;
+    if (r1 < 0.15) {
+      // sehr bewölkt / Regen – wenig Erzeugung
+      weatherFactor = 0.2 + r2 * 0.2; // 0.2–0.4
+    } else if (r1 < 0.4) {
+      // bewölkt
+      weatherFactor = 0.4 + r2 * 0.3; // 0.4–0.7
+    } else if (r1 < 0.8) {
+      // normal
+      weatherFactor = 0.7 + r2 * 0.3; // 0.7–1.0
+    } else {
+      // sehr sonnig
+      weatherFactor = 1.0 + r2 * 0.2; // 1.0–1.2
+    }
+    pvDayScales[d] = seasonFactor * weatherFactor;
+  }
+  return pvDayScales;
+}
+
 // ===== MSCONS builder =====
 function buildMSCONS(options: {
   malo: string;
@@ -256,6 +293,7 @@ type MaLoCfg = {
 };
 
 type TestResult = { name: string; pass: boolean; info?: string };
+type PreviewPoint = { dayLabel: string; kWh: number };
 
 const LIMIT_MB = 50; // Guard
 
@@ -295,6 +333,11 @@ export default function MSCONSGenerator() {
   );
 
   const [configs, setConfigs] = useState<MaLoCfg[]>([]);
+  const [fallbackLinks, setFallbackLinks] = useState<
+    { name: string; href: string }[]
+  >([]);
+  const [tests, setTests] = useState<TestResult[]>([]);
+  const [isGenerating, setIsGenerating] = useState(false);
 
   // Sync configs with maloList
   useEffect(() => {
@@ -313,157 +356,186 @@ export default function MSCONSGenerator() {
     });
   }, [maloList, defaults]);
 
-  const [fallbackLinks, setFallbackLinks] = useState<
-    { name: string; href: string }[]
-  >([]);
+  // cleanup Blob URLs on unmount
   useEffect(
     () => () => {
-      // cleanup Blob URLs on unmount
       fallbackLinks.forEach((l) => URL.revokeObjectURL(l.href));
     },
     [fallbackLinks]
   );
 
-  async function handleGenerateZip() {
-    // Zeitraum: 22:00 → 22:00 nächster Tag
+  // Grobe Stats für UX: erwartete Dateianzahl & Größe
+  const stats = useMemo(() => {
+    const fileCount = configs.length * days;
+    // grobe Abschätzung: ~20 kB pro MSCONS-Datei
+    const estimatedMb = (fileCount * 20000) / (1024 * 1024);
+    return { fileCount, estimatedMb };
+  }, [configs, days]);
+
+  // Preview-Daten (erste MaLo, Tagesenergie)
+  const previewData = useMemo<PreviewPoint[]>(() => {
+    if (!configs.length) return [];
+    const cfg = configs[0];
     const startBase = new Date(`${date}T22:00:00Z`);
-    const masterZip = new JSZip();
+    const points: PreviewPoint[] = [];
 
-    type FileItem = { malo: string; name: string; content: string };
-
-    // PV-Tagesskalen (Saison + Wetter) – gemeinsam für alle Erzeuger
-    const weatherRand = rnd(2025);
-    const pvDayScales: number[] = [];
-    for (let d = 0; d < days; d++) {
-      const dayDate = new Date(startBase.getTime() + d * 24 * 3600 * 1000);
-      const seasonFactor = getPVSeasonFactor(dayDate);
-      const r1 = weatherRand();
-      const r2 = weatherRand();
-      let weatherFactor: number;
-      if (r1 < 0.15) {
-        // sehr bewölkt / Regen – wenig Erzeugung
-        weatherFactor = 0.2 + r2 * 0.2; // 0.2–0.4
-      } else if (r1 < 0.4) {
-        // bewölkt
-        weatherFactor = 0.4 + r2 * 0.3; // 0.4–0.7
-      } else if (r1 < 0.8) {
-        // normal
-        weatherFactor = 0.7 + r2 * 0.3; // 0.7–1.0
-      } else {
-        // sehr sonnig
-        weatherFactor = 1.0 + r2 * 0.2; // 1.0–1.2
-      }
-      pvDayScales[d] = seasonFactor * weatherFactor;
-    }
-
-    const allFiles: FileItem[] = [];
-
-    configs.forEach((cfg, idx) => {
-      const seedBase = 1000 + idx * 97;
+    if (cfg.direction === "consumption") {
+      const seedBase = 1000; // entspricht idx=0 im Generator
       for (let d = 0; d < days; d++) {
-        const start = new Date(startBase.getTime() + d * 24 * 3600 * 1000);
-        const end = new Date(start.getTime() + 24 * 3600 * 1000);
-        const ymd = `${start.getUTCFullYear()}${pad(
-          start.getUTCMonth() + 1
-        )}${pad(start.getUTCDate())}`;
-
-        if (cfg.direction === "consumption") {
-          // Tagesvariation pro Tag (±20 %) um den Jahresmittelwert herum
-          const baseDailyKWh = cfg.expectedAnnualKWh / 365;
-          const dayRandGen = rnd(seedBase + d * 7919);
-          const dayFactor = 0.8 + dayRandGen() * 0.4; // 0.8–1.2
-          const dailyKWh = baseDailyKWh * dayFactor;
-
-          const vals = makeSLPValues(
-            96,
-            cfg.slp,
-            dailyKWh,
-            defaults.noisePct,
-            seedBase + d
-          );
-          const content = buildMSCONS({
-            malo: cfg.malo,
-            obis: "1.8.0",
-            start,
-            end,
-            values: vals,
-          });
-          const name = `MSCONS_${APP_CODE}_${SENDER_ID}_${RECIPIENT_ID}_${ymd}_${cfg.malo}_VERBRAUCH.txt`;
-          allFiles.push({ malo: cfg.malo, name, content });
-        } else {
-          // PV-Erzeugung mit saisonaler + wetterbedingter Skalierung
-          const dayScale = pvDayScales[d];
-          const vals = makePVProfile(
-            96,
-            cfg.pvPeakKW,
-            seedBase + 33 + d,
-            dayScale
-          );
-          const content = buildMSCONS({
-            malo: cfg.malo,
-            obis: "2.8.0",
-            start,
-            end,
-            values: vals,
-          });
-          const name = `MSCONS_${APP_CODE}_${SENDER_ID}_${RECIPIENT_ID}_${ymd}_${cfg.malo}_ERZEUGUNG.txt`;
-          allFiles.push({ malo: cfg.malo, name, content });
-        }
+        const baseDailyKWh = cfg.expectedAnnualKWh / 365;
+        const dayRandGen = rnd(seedBase + d * 7919);
+        const dayFactor = 0.8 + dayRandGen() * 0.4; // 0.8–1.2
+        const dailyKWh = baseDailyKWh * dayFactor;
+        const dayDate = new Date(startBase.getTime() + d * 24 * 3600 * 1000);
+        points.push({
+          dayLabel: `${pad(dayDate.getUTCDate())}.${pad(
+            dayDate.getUTCMonth() + 1
+          )}`,
+          kWh: Number(dailyKWh.toFixed(1)),
+        });
       }
-    });
+    } else {
+      const pvDayScales = computePvDayScales(startBase, days);
+      for (let d = 0; d < days; d++) {
+        const scale = pvDayScales[d];
+        // grobe Abschätzung: ~3.8 kWh/kWp bei scale≈1
+        const approxDailyKWh = cfg.pvPeakKW * scale * 3.8;
+        const dayDate = new Date(startBase.getTime() + d * 24 * 3600 * 1000);
+        points.push({
+          dayLabel: `${pad(dayDate.getUTCDate())}.${pad(
+            dayDate.getUTCMonth() + 1
+          )}`,
+          kWh: Number(approxDailyKWh.toFixed(1)),
+        });
+      }
+    }
 
-    // Size guard (approx): ASCII byte length
-    const approxBytes = allFiles.reduce((sum, f) => sum + f.content.length, 0);
-    const limitBytes = LIMIT_MB * 1024 * 1024; // 50 MB
-    if (approxBytes > limitBytes) {
-      const proceed = window.confirm(
-        `You're about to generate ~${(
-          approxBytes /
-          (1024 * 1024)
-        ).toFixed(1)} MB of data (> ${LIMIT_MB} MB). Continue?`
+    return points;
+  }, [configs, date, days]);
+
+  async function handleGenerateZip() {
+    setIsGenerating(true);
+    try {
+      // Zeitraum: 22:00 → 22:00 nächster Tag
+      const startBase = new Date(`${date}T22:00:00Z`);
+      const masterZip = new JSZip();
+
+      type FileItem = { malo: string; name: string; content: string };
+
+      // PV-Tagesskalen (Saison + Wetter) – gemeinsam für alle Erzeuger
+      const pvDayScales = computePvDayScales(startBase, days);
+
+      const allFiles: FileItem[] = [];
+
+      configs.forEach((cfg, idx) => {
+        const seedBase = 1000 + idx * 97;
+        for (let d = 0; d < days; d++) {
+          const start = new Date(startBase.getTime() + d * 24 * 3600 * 1000);
+          const end = new Date(start.getTime() + 24 * 3600 * 1000);
+          const ymd = `${start.getUTCFullYear()}${pad(
+            start.getUTCMonth() + 1
+          )}${pad(start.getUTCDate())}`;
+
+          if (cfg.direction === "consumption") {
+            // Tagesvariation pro Tag (±20 %) um den Jahresmittelwert herum
+            const baseDailyKWh = cfg.expectedAnnualKWh / 365;
+            const dayRandGen = rnd(seedBase + d * 7919);
+            const dayFactor = 0.8 + dayRandGen() * 0.4; // 0.8–1.2
+            const dailyKWh = baseDailyKWh * dayFactor;
+
+            const vals = makeSLPValues(
+              96,
+              cfg.slp,
+              dailyKWh,
+              defaults.noisePct,
+              seedBase + d
+            );
+            const content = buildMSCONS({
+              malo: cfg.malo,
+              obis: "1.8.0",
+              start,
+              end,
+              values: vals,
+            });
+            const name = `MSCONS_${APP_CODE}_${SENDER_ID}_${RECIPIENT_ID}_${ymd}_${cfg.malo}_VERBRAUCH.txt`;
+            allFiles.push({ malo: cfg.malo, name, content });
+          } else {
+            // PV-Erzeugung mit saisonaler + wetterbedingter Skalierung
+            const dayScale = pvDayScales[d];
+            const vals = makePVProfile(
+              96,
+              cfg.pvPeakKW,
+              seedBase + 33 + d,
+              dayScale
+            );
+            const content = buildMSCONS({
+              malo: cfg.malo,
+              obis: "2.8.0",
+              start,
+              end,
+              values: vals,
+            });
+            const name = `MSCONS_${APP_CODE}_${SENDER_ID}_${RECIPIENT_ID}_${ymd}_${cfg.malo}_ERZEUGUNG.txt`;
+            allFiles.push({ malo: cfg.malo, name, content });
+          }
+        }
+      });
+
+      // Size guard (approx): ASCII byte length
+      const approxBytes = allFiles.reduce(
+        (sum, f) => sum + f.content.length,
+        0
       );
-      if (!proceed) return;
+      const limitBytes = LIMIT_MB * 1024 * 1024; // 50 MB
+      if (approxBytes > limitBytes) {
+        const proceed = window.confirm(
+          `You're about to generate ~${(
+            approxBytes /
+            (1024 * 1024)
+          ).toFixed(1)} MB of data (> ${LIMIT_MB} MB). Continue?`
+        );
+        if (!proceed) return;
+      }
+
+      // Build per-MaLo ZIPs (nur für optionale Einzel-Downloads)
+      const perMaLoZipBlobs: { name: string; blob: Blob }[] = [];
+      for (const cfg of configs) {
+        const maloZip = new JSZip();
+        const filesForMalo = allFiles.filter((f) => f.malo === cfg.malo);
+        filesForMalo.forEach((f) => maloZip.file(f.name, f.content));
+        const maloBlob = await maloZip.generateAsync({ type: "blob" });
+        const maloZipName = `MSCONS_${date.replace(/-/g, "")}_${cfg.malo}.zip`;
+        perMaLoZipBlobs.push({ name: maloZipName, blob: maloBlob });
+      }
+
+      // Master ZIP: alle MSCONS-Dateien flach (keine ZIP-in-ZIP-Struktur)
+      allFiles.forEach((f) => {
+        masterZip.file(f.name, f.content);
+      });
+
+      const masterBlob = await masterZip.generateAsync({ type: "blob" });
+      const masterName = `MSCONS_${date.replace(/-/g, "")}_${
+        configs.length
+      }MaLo_master.zip`;
+      saveAs(masterBlob, masterName);
+
+      // Fallback links (Master + per-MaLo ZIPs)
+      const links = [
+        { name: masterName, href: URL.createObjectURL(masterBlob) },
+        ...perMaLoZipBlobs.map((z) => ({
+          name: z.name,
+          href: URL.createObjectURL(z.blob),
+        })),
+      ];
+      setFallbackLinks(links);
+    } finally {
+      setIsGenerating(false);
     }
-
-    // Build per-MaLo ZIPs (nur für optionale Einzel-Downloads)
-    const perMaLoZipBlobs: { name: string; blob: Blob }[] = [];
-    for (const cfg of configs) {
-      const maloZip = new JSZip();
-      const filesForMalo = allFiles.filter((f) => f.malo === cfg.malo);
-      filesForMalo.forEach((f) => maloZip.file(f.name, f.content));
-      const maloBlob = await maloZip.generateAsync({ type: "blob" });
-      const maloZipName = `MSCONS_${date.replace(/-/g, "")}_${cfg.malo}.zip`;
-      perMaLoZipBlobs.push({ name: maloZipName, blob: maloBlob });
-    }
-
-    // Master ZIP: alle MSCONS-Dateien flach (keine ZIP-in-ZIP-Struktur)
-    allFiles.forEach((f) => {
-      masterZip.file(f.name, f.content);
-    });
-
-    const masterBlob = await masterZip.generateAsync({ type: "blob" });
-    const masterName = `MSCONS_${date.replace(/-/g, "")}_${
-      configs.length
-    }MaLo_master.zip`;
-    saveAs(masterBlob, masterName);
-
-    // Fallback links (Master + per-MaLo ZIPs)
-    const links = [
-      { name: masterName, href: URL.createObjectURL(masterBlob) },
-      ...perMaLoZipBlobs.map((z) => ({
-        name: z.name,
-        href: URL.createObjectURL(z.blob),
-      })),
-    ];
-    setFallbackLinks(links);
   }
 
-  // ---------- Self-Tests ----------
-  const [tests, setTests] = useState<TestResult[]>([]);
   function runSelfTests() {
     const results: TestResult[] = [];
 
-    // 1) Regex split correctness (CRLF/LF + trim + dedupe)
     const sample = "A\r\nB\n\n C ";
     const split = Array.from(
       new Set(
@@ -478,11 +550,9 @@ export default function MSCONSGenerator() {
       pass: split.length === 2 && split[0] === "A" && split[1] === "B",
     });
 
-    // 2) One-day values length per SLP
     const valsH0 = makeSLPValues(96, "H0", 20, 5, 123);
     results.push({ name: "H0 96 values", pass: valsH0.length === 96 });
 
-    // 3) Sum normalization ≈ dailyKWh
     const sum = valsH0.reduce((a, b) => a + b, 0);
     results.push({
       name: "Daily sum ≈ 20 kWh",
@@ -490,7 +560,6 @@ export default function MSCONSGenerator() {
       info: `sum=${sum.toFixed(3)}`,
     });
 
-    // 4) MSCONS structure (single day, Verbrauch)
     const start = new Date("2025-08-15T22:00:00Z");
     const end = new Date(start.getTime() + 24 * 3600 * 1000);
     const txt = buildMSCONS({
@@ -518,7 +587,6 @@ export default function MSCONSGenerator() {
       info: `found ${(txt.match(/QTY\+220:/g) || []).length}`,
     });
 
-    // 5) MSCONS structure (single day, Erzeugung 2.8.0)
     const genVals = makePVProfile(96, 5, 321, 1.0);
     const txtGen = buildMSCONS({
       malo: "99999999999",
@@ -544,7 +612,6 @@ export default function MSCONSGenerator() {
       pass: (txtGen.match(/QTY\+220:/g) || []).length === 96,
     });
 
-    // 6) Daily file naming check
     const ymd = "20250815";
     const nameC = `MSCONS_${APP_CODE}_${SENDER_ID}_${RECIPIENT_ID}_${ymd}_12345678901_VERBRAUCH.txt`;
     const nameG = `MSCONS_${APP_CODE}_${SENDER_ID}_${RECIPIENT_ID}_${ymd}_12345678901_ERZEUGUNG.txt`;
@@ -559,6 +626,50 @@ export default function MSCONSGenerator() {
     setTests(results);
   }
 
+  function updateCfg(malo: string, patch: Partial<MaLoCfg>) {
+    setConfigs((list) =>
+      list.map((c) => (c.malo === malo ? { ...c, ...patch } : c))
+    );
+  }
+
+  function addPreset(type: "H0" | "G0" | "PV") {
+    const existing = new Set(maloList);
+    let id: string;
+    do {
+      id =
+        "5" +
+        Math.floor(1_000_000_000 + Math.random() * 9_000_000_000).toString(); // 11-stellig, beginnt mit 5
+    } while (existing.has(id));
+
+    const baseCfg: MaLoCfg =
+      type === "H0"
+        ? {
+            malo: id,
+            direction: "consumption",
+            slp: "H0",
+            expectedAnnualKWh: 3500,
+            pvPeakKW: 4,
+          }
+        : type === "G0"
+        ? {
+            malo: id,
+            direction: "consumption",
+            slp: "G0",
+            expectedAnnualKWh: 30000,
+            pvPeakKW: 10,
+          }
+        : {
+            malo: id,
+            direction: "generation",
+            slp: "H0",
+            expectedAnnualKWh: 0,
+            pvPeakKW: 5,
+          };
+
+    setRawMalos((prev) => (prev ? `${prev}\n${id}` : id));
+    setConfigs((prev) => [...prev, baseCfg]);
+  }
+
   return (
     <div className="p-6 max-w-6xl mx-auto space-y-6">
       {/* Header + Version */}
@@ -567,7 +678,7 @@ export default function MSCONSGenerator() {
           <Zap className="w-6 h-6" />
           <div>
             <h1 className="text-2xl font-semibold">MSCONS Generator</h1>
-            <div className="text-xs text-muted-foreground flex items-center gap-1">
+            <div className="text-xs text-muted-foreground flex items-center gap-2 mt-1">
               <span className="inline-flex items-center px-2 py-0.5 rounded-full border border-slate-300">
                 Version {APP_VERSION}
               </span>
@@ -577,36 +688,66 @@ export default function MSCONSGenerator() {
         </div>
       </div>
 
-      {/* Zeitraum & MaLo-Liste */}
+      {/* Zeitraum & MaLo-Liste + Presets */}
       <Card className="shadow-sm">
-        <CardContent className="p-6 grid md:grid-cols-3 gap-4">
-          <div>
-            <Label>Startdatum (ohne Zeit)</Label>
-            <Input
-              type="date"
-              value={date}
-              onChange={(e) => setDate(e.target.value)}
-            />
+        <CardContent className="p-6 space-y-4">
+          <div className="grid md:grid-cols-3 gap-4">
+            <div>
+              <Label>Startdatum (ohne Zeit)</Label>
+              <Input
+                type="date"
+                value={date}
+                onChange={(e) => setDate(e.target.value)}
+              />
+            </div>
+            <div>
+              <Label>Tage</Label>
+              <Input
+                type="number"
+                min={1}
+                max={365}
+                value={days}
+                onChange={(e) =>
+                  setDays(parseInt(e.target.value || "1", 10))
+                }
+              />
+            </div>
+            <div>
+              <Label>MaLo-IDs (eine pro Zeile)</Label>
+              <Textarea
+                rows={4}
+                value={rawMalos}
+                onChange={(e) => setRawMalos(e.target.value)}
+              />
+            </div>
           </div>
-          <div>
-            <Label>Tage</Label>
-            <Input
-              type="number"
-              min={1}
-              max={365}
-              value={days}
-              onChange={(e) =>
-                setDays(parseInt(e.target.value || "1", 10))
-              }
-            />
-          </div>
-          <div>
-            <Label>MaLo-IDs (eine pro Zeile)</Label>
-            <Textarea
-              rows={4}
-              value={rawMalos}
-              onChange={(e) => setRawMalos(e.target.value)}
-            />
+
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <span className="text-muted-foreground">Schnell-Presets:</span>
+            <Button
+              type="button"
+              size="xs"
+              variant="outline"
+              onClick={() => addPreset("H0")}
+            >
+              H0 Haushalt ~3.500 kWh
+            </Button>
+            <Button
+              type="button"
+              size="xs"
+              variant="outline"
+              onClick={() => addPreset("G0")}
+            >
+              G0 Gewerbe ~30.000 kWh
+            </Button>
+            <Button
+              type="button"
+              size="xs"
+              variant="outline"
+              onClick={() => addPreset("PV")}
+            >
+              PV ~5 kWp
+            </Button>
           </div>
         </CardContent>
       </Card>
@@ -619,8 +760,8 @@ export default function MSCONSGenerator() {
             <div className="text-[11px] text-muted-foreground flex items-center gap-1">
               <Info className="w-3 h-3" />
               <span>
-                PV-Wetter &amp; Tagesform gelten immer für alle Erzeuger,
-                die im selben Schritt generiert werden.
+                PV-Wetter &amp; Tagesform gelten immer für alle Erzeuger, die im
+                selben Schritt generiert werden.
               </span>
             </div>
           </div>
@@ -736,20 +877,95 @@ export default function MSCONSGenerator() {
           <div className="text-xs text-muted-foreground flex items-center gap-1">
             <Shuffle className="w-3 h-3" />
             <span>
-              Zufällige Abweichungen je Intervall; tägliche Summe wird
-              auf Ziel-kWh normalisiert. Verbrauch nutzt H0/G0/L0-SLP,
-              PV basiert auf kWp, Saison &amp; Wetter.
+              Zufällige Abweichungen je Intervall; tägliche Summe wird auf
+              Ziel-kWh normalisiert. Verbrauch nutzt H0/G0/L0-SLP, PV basiert
+              auf kWp, Saison &amp; Wetter.
             </span>
           </div>
+        </CardContent>
+      </Card>
+
+      {/* Preview Chart */}
+      <Card className="shadow-sm">
+        <CardContent className="p-6 space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="text-sm font-medium">
+              Vorschau: Tagesenergie (erste MaLo)
+            </div>
+            <div className="text-xs text-muted-foreground">
+              {configs[0]
+                ? `${configs[0].malo} · ${
+                    configs[0].direction === "consumption"
+                      ? "Verbrauch"
+                      : "Erzeugung"
+                  }`
+                : "Keine MaLo konfiguriert"}
+            </div>
+          </div>
+          {previewData.length > 0 ? (
+            <div className="h-64">
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={previewData}>
+                  <CartesianGrid strokeDasharray="3 3" />
+                  <XAxis dataKey="dayLabel" />
+                  <YAxis
+                    label={{
+                      value: "kWh/Tag",
+                      angle: -90,
+                      position: "insideLeft",
+                    }}
+                  />
+                  <Tooltip />
+                  <Line
+                    type="monotone"
+                    dataKey="kWh"
+                    dot={false}
+                    stroke="#0f766e"
+                    strokeWidth={2}
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          ) : (
+            <div className="text-sm text-muted-foreground">
+              Bitte mindestens eine MaLo konfigurieren, um eine Vorschau zu
+              sehen.
+            </div>
+          )}
         </CardContent>
       </Card>
 
       {/* Generate */}
       <Card className="shadow-sm">
         <CardContent className="p-6 space-y-4">
-          <Button onClick={handleGenerateZip} className="gap-2">
-            <Package className="w-4 h-4" /> ZIP erzeugen & herunterladen
-          </Button>
+          <div className="flex items-center justify-between gap-3">
+            <Button
+              onClick={handleGenerateZip}
+              className="gap-2"
+              disabled={isGenerating || configs.length === 0}
+            >
+              {isGenerating ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  Wird generiert …
+                </>
+              ) : (
+                <>
+                  <Package className="w-4 h-4" />
+                  ZIP erzeugen & herunterladen
+                </>
+              )}
+            </Button>
+            <div className="text-xs text-muted-foreground text-right">
+              {stats.fileCount > 0 && (
+                <>
+                  Voraussichtlich {stats.fileCount} Dateien (
+                  ~{stats.estimatedMb.toFixed(2)} MB)
+                </>
+              )}
+            </div>
+          </div>
+
           {fallbackLinks.length > 0 && (
             <div className="mt-2">
               <div className="text-sm mb-1">
@@ -810,23 +1026,17 @@ export default function MSCONSGenerator() {
         <div className="flex items-center gap-1">
           <Sun className="w-3 h-3" />
           <span>
-            Format: UNA vorhanden, UNB direkt anschließend, keine
-            Zeilenumbrüche zwischen Segmenten, UNT korrekt gezählt.
-            15-Min-Intervalle (DTM 163/164) über den gewählten Zeitraum.
+            Format: UNA vorhanden, UNB direkt anschließend, keine Zeilenumbrüche
+            zwischen Segmenten, UNT korrekt gezählt. 15-Min-Intervalle
+            (DTM 163/164) über den gewählten Zeitraum.
           </span>
         </div>
         <div>
-          Hinweis: Nur Erzeuger, die im selben Generierungslauf
-          erstellt werden, teilen sich exakt dieselben Wetter- &
-          Saisonfaktoren (gleiche „Wettertage“ im Monat).
+          Hinweis: Nur Erzeuger, die im selben Generierungslauf erstellt werden,
+          teilen sich exakt dieselben Wetter- &amp; Saisonfaktoren (gleiche
+          „Wettertage“ im Monat).
         </div>
       </div>
     </div>
   );
-
-  function updateCfg(malo: string, patch: Partial<MaLoCfg>) {
-    setConfigs((list) =>
-      list.map((c) => (c.malo === malo ? { ...c, ...patch } : c))
-    );
-  }
 }
