@@ -1,19 +1,30 @@
-const { useState, useEffect, useMemo } = React;
+// app.jsx – MSCONS Generator (pure JS/JSX, no TypeScript)
 
-// ===== Fixed EDIFACT header fields =====
+const { useState, useEffect, useMemo } = React;
+const {
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+} = window.Recharts || {};
+
+// Version-Tag
+const APP_VERSION = "2025-11-19-03"; // neue Version für die Glättung
+
+// EDIFACT Header-Konstanten
 const SENDER_ID = "9979383000006";
 const RECIPIENT_ID = "9906629000002";
-const APP_CODE = "TL"; // constant
-const APP_VERSION = "2025-11-19-02";
-const LIMIT_MB = 50; // Size guard
+const APP_CODE = "TL";
 
-// ===== Helper utils =====
+// Helper
 function pad(n, w = 2) {
   return n.toString().padStart(w, "0");
 }
 
 function formatEdifactDateTime(dt) {
-  // YYYYMMDDHHMM?+00 (UTC)
   const y = dt.getUTCFullYear();
   const m = pad(dt.getUTCMonth() + 1);
   const d = pad(dt.getUTCDate());
@@ -34,11 +45,10 @@ function seg() {
   return Array.from(arguments).join("+") + "'";
 }
 
-// ===== Time window helpers =====
-const SLOTS_PER_DAY = 96; // 24h * 4
+const SLOTS_PER_DAY = 96;
 const SLOT_MS = 15 * 60 * 1000;
 
-// Saisonfaktoren für PV (Juni/Juli ~1.0, Winter deutlich niedriger)
+// Saisonfaktoren für PV
 const PV_SEASON_FACTORS = [
   0.25, // Jan
   0.3, // Feb
@@ -55,11 +65,10 @@ const PV_SEASON_FACTORS = [
 ];
 
 function getPVSeasonFactor(date) {
-  const m = date.getUTCMonth(); // 0-11
-  return PV_SEASON_FACTORS[m] || 0.5;
+  const m = date.getUTCMonth();
+  return PV_SEASON_FACTORS[m] ?? 0.5;
 }
 
-// ===== SLP Shapes (normalized per day, later scaled) =====
 function gaussian(x, mu, sigma) {
   return Math.exp(-((x - mu) ** 2) / (2 * sigma ** 2));
 }
@@ -96,27 +105,23 @@ function makeSLPValues(slots, slp, dailyKWh, noisePct, seed) {
 
   for (let i = 0; i < SLOTS_PER_DAY; i++) {
     const hour = (i * 15) / 60;
-    let v;
-    if (slp === "H0") v = shapeH0(hour);
-    else if (slp === "G0") v = shapeG0(hour);
-    else v = shapeL0(hour);
+    const v =
+      slp === "H0" ? shapeH0(hour) : slp === "G0" ? shapeG0(hour) : shapeL0(hour);
     oneDay.push(v);
     sumDay += v;
   }
 
-  // normalize to 1.0
   for (let i = 0; i < SLOTS_PER_DAY; i++) {
     oneDay[i] = oneDay[i] / sumDay;
   }
 
   const vals = [];
   for (let i = 0; i < slots; i++) {
-    const base = oneDay[i % SLOTS_PER_DAY] * dailyKWh; // kWh/day portion
+    const base = oneDay[i % SLOTS_PER_DAY] * dailyKWh;
     const noise = 1 + (r() - 0.5) * (2 * noisePct / 100);
     vals.push(Number(Math.max(0, base * noise).toFixed(3)));
   }
 
-  // Re-normalize per day
   const dcount = Math.floor(slots / SLOTS_PER_DAY);
   for (let d = 0; d < dcount; d++) {
     const s = d * SLOTS_PER_DAY;
@@ -132,7 +137,6 @@ function makeSLPValues(slots, slp, dailyKWh, noisePct, seed) {
   return vals;
 }
 
-// PV-Profil mit Tages-Skala (Saison + Wetter)
 function makePVProfile(slots, peakKW, seed, dayScale) {
   const r = rnd(seed + 12345);
   const vals = [];
@@ -145,40 +149,49 @@ function makePVProfile(slots, peakKW, seed, dayScale) {
   return vals;
 }
 
-// PV-Tagesfaktoren (Saison + Wetter) – zentral, damit Generator & Preview identisch sind
+// NEU: engerer Wetterbereich + 3-Tage-Glättung
 function computePvDayScales(startBase, days) {
   const weatherRand = rnd(2025);
-  const pvDayScales = [];
+  const raw = [];
+
   for (let d = 0; d < days; d++) {
     const dayDate = new Date(startBase.getTime() + d * 24 * 3600 * 1000);
     const seasonFactor = getPVSeasonFactor(dayDate);
     const r1 = weatherRand();
     const r2 = weatherRand();
     let weatherFactor;
+
     if (r1 < 0.15) {
-      weatherFactor = 0.2 + r2 * 0.2; // 0.2–0.4
+      // schlechter Tag
+      weatherFactor = 0.5 + r2 * 0.1; // 0.5–0.6
     } else if (r1 < 0.4) {
-      weatherFactor = 0.4 + r2 * 0.3; // 0.4–0.7
+      // bewölkt
+      weatherFactor = 0.6 + r2 * 0.15; // 0.6–0.75
     } else if (r1 < 0.8) {
-      weatherFactor = 0.7 + r2 * 0.3; // 0.7–1.0
+      // normal
+      weatherFactor = 0.75 + r2 * 0.15; // 0.75–0.9
     } else {
-      weatherFactor = 1.0 + r2 * 0.2; // 1.0–1.2
+      // sehr sonnig
+      weatherFactor = 0.9 + r2 * 0.15; // 0.9–1.05
     }
-    pvDayScales[d] = seasonFactor * weatherFactor;
+
+    raw[d] = seasonFactor * weatherFactor;
   }
-  return pvDayScales;
+
+  // 3-Tage-Moving-Average
+  const smoothed = raw.map((v, i) => {
+    const prev = raw[i - 1] !== undefined ? raw[i - 1] : v;
+    const next = raw[i + 1] !== undefined ? raw[i + 1] : v;
+    return 0.25 * prev + 0.5 * v + 0.25 * next;
+  });
+
+  return smoothed;
 }
 
-// ===== MSCONS builder =====
 function buildMSCONS(options) {
-  const malo = options.malo;
-  const obis = options.obis;
-  const start = options.start;
-  const end = options.end;
-  const values = options.values;
-
+  const { malo, obis, start, end, values } = options;
   const ts = new Date();
-  const rand = Math.floor(Math.random() * 9000000) + 1000000;
+  const rand = Math.floor(Math.random() * 9_000_000) + 1_000_000;
   const docId = `D${rand}`;
   const msgRef = `MS${rand}${pad(ts.getUTCSeconds(), 2)}`;
 
@@ -231,7 +244,7 @@ function buildMSCONS(options) {
   return segments.join("");
 }
 
-// ===== React App =====
+const LIMIT_MB = 50;
 
 function MSCONSGenerator() {
   const [date, setDate] = useState("2025-08-01");
@@ -242,36 +255,33 @@ function MSCONSGenerator() {
 
   const [defaults] = useState({
     slp: "H0",
-    expectedAnnualKWh: 7300, // ~20 kWh/day
-    noisePct: 15,
+    expectedAnnualKWh: 7300,
+    noisePct: 6, // vorher 15 – weniger Intraday-Noise
     direction: "consumption",
     pvPeakKW: 4,
   });
 
-  const maloList = useMemo(
-    () =>
-      Array.from(
-        new Set(
-          rawMalos
-            .split(/\r?\n/)
-            .map((s) => s.trim())
-            .filter(Boolean)
-        )
-      ),
-    [rawMalos]
-  );
+  const maloList = useMemo(() => {
+    return Array.from(
+      new Set(
+        rawMalos
+          .split(/\r?\n/)
+          .map((s) => s.trim())
+          .filter(Boolean)
+      )
+    );
+  }, [rawMalos]);
 
   const [configs, setConfigs] = useState([]);
   const [fallbackLinks, setFallbackLinks] = useState([]);
   const [tests, setTests] = useState([]);
   const [isGenerating, setIsGenerating] = useState(false);
 
-  // Sync configs with maloList
-  useEffect(
-    () => {
-      setConfigs((prev) => {
-        const byId = new Map(prev.map((p) => [p.malo, p]));
-        return maloList.map((m) =>
+  useEffect(() => {
+    setConfigs((prev) => {
+      const byId = new Map(prev.map((p) => [p.malo, p]));
+      return maloList.map(
+        (m) =>
           byId.get(m) || {
             malo: m,
             direction: defaults.direction,
@@ -279,83 +289,64 @@ function MSCONSGenerator() {
             expectedAnnualKWh: defaults.expectedAnnualKWh,
             pvPeakKW: defaults.pvPeakKW,
           }
-        );
-      });
-    },
-    [maloList, defaults]
-  );
+      );
+    });
+  }, [maloList, defaults]);
 
-  // cleanup Blob URLs on unmount
-  useEffect(
-    () => {
-      return () => {
-        fallbackLinks.forEach((l) => URL.revokeObjectURL(l.href));
-      };
-    },
-    [fallbackLinks]
-  );
+  useEffect(() => {
+    return () => {
+      fallbackLinks.forEach((l) => URL.revokeObjectURL(l.href));
+    };
+  }, [fallbackLinks]);
 
-  // Grobe Stats für UX: erwartete Dateianzahl & Größe
-  const stats = useMemo(
-    () => {
-      const fileCount = configs.length * days;
-      const estimatedMb = (fileCount * 20000) / (1024 * 1024);
-      return { fileCount, estimatedMb };
-    },
-    [configs, days]
-  );
+  const stats = useMemo(() => {
+    const fileCount = configs.length * days;
+    const estimatedMb = (fileCount * 20000) / (1024 * 1024);
+    return { fileCount, estimatedMb };
+  }, [configs, days]);
 
-  // Preview-Daten (erste MaLo, Tagesenergie)
-  const previewData = useMemo(
-    () => {
-      if (!configs.length) return [];
-      const cfg = configs[0];
-      const startBase = new Date(date + "T22:00:00Z");
-      const points = [];
+  const previewData = useMemo(() => {
+    if (!configs.length) return [];
+    const cfg = configs[0];
+    const startBase = new Date(date + "T22:00:00Z");
+    const points = [];
 
-      if (cfg.direction === "consumption") {
-        const seedBase = 1000;
-        for (let d = 0; d < days; d++) {
-          const baseDailyKWh = cfg.expectedAnnualKWh / 365;
-          const dayRandGen = rnd(seedBase + d * 7919);
-          const dayFactor = 0.8 + dayRandGen() * 0.4; // 0.8–1.2
-          const dailyKWh = baseDailyKWh * dayFactor;
-          const dayDate = new Date(startBase.getTime() + d * 24 * 3600 * 1000);
-          points.push({
-            dayLabel:
-              pad(dayDate.getUTCDate()) +
-              "." +
-              pad(dayDate.getUTCMonth() + 1),
-            kWh: Number(dailyKWh.toFixed(1)),
-          });
-        }
-      } else {
-        const pvDayScales = computePvDayScales(startBase, days);
-        for (let d = 0; d < days; d++) {
-          const scale = pvDayScales[d];
-          const approxDailyKWh = cfg.pvPeakKW * scale * 3.8;
-          const dayDate = new Date(startBase.getTime() + d * 24 * 3600 * 1000);
-          points.push({
-            dayLabel:
-              pad(dayDate.getUTCDate()) +
-              "." +
-              pad(dayDate.getUTCMonth() + 1),
-            kWh: Number(approxDailyKWh.toFixed(1)),
-          });
-        }
+    if (cfg.direction === "consumption") {
+      const seedBase = 1000;
+      for (let d = 0; d < days; d++) {
+        const baseDailyKWh = cfg.expectedAnnualKWh / 365;
+        const dayRandGen = rnd(seedBase + d * 7919);
+        const dayFactor = 0.92 + dayRandGen() * 0.16; // 0.92–1.08
+        const dailyKWh = baseDailyKWh * dayFactor;
+        const dayDate = new Date(startBase.getTime() + d * 24 * 3600 * 1000);
+        points.push({
+          dayLabel:
+            pad(dayDate.getUTCDate()) + "." + pad(dayDate.getUTCMonth() + 1),
+          kWh: Number(dailyKWh.toFixed(1)),
+        });
       }
+    } else {
+      const pvDayScales = computePvDayScales(startBase, days);
+      for (let d = 0; d < days; d++) {
+        const scale = pvDayScales[d];
+        const approxDailyKWh = cfg.pvPeakKW * scale * 3.8;
+        const dayDate = new Date(startBase.getTime() + d * 24 * 3600 * 1000);
+        points.push({
+          dayLabel:
+            pad(dayDate.getUTCDate()) + "." + pad(dayDate.getUTCMonth() + 1),
+          kWh: Number(approxDailyKWh.toFixed(1)),
+        });
+      }
+    }
 
-      return points;
-    },
-    [configs, date, days]
-  );
+    return points;
+  }, [configs, date, days]);
 
   async function handleGenerateZip() {
     setIsGenerating(true);
     try {
       const startBase = new Date(date + "T22:00:00Z");
       const masterZip = new JSZip();
-
       const pvDayScales = computePvDayScales(startBase, days);
       const allFiles = [];
 
@@ -365,14 +356,14 @@ function MSCONSGenerator() {
           const start = new Date(startBase.getTime() + d * 24 * 3600 * 1000);
           const end = new Date(start.getTime() + 24 * 3600 * 1000);
           const ymd =
-            start.getUTCFullYear() +
+            start.getUTCFullYear().toString() +
             pad(start.getUTCMonth() + 1) +
             pad(start.getUTCDate());
 
           if (cfg.direction === "consumption") {
             const baseDailyKWh = cfg.expectedAnnualKWh / 365;
             const dayRandGen = rnd(seedBase + d * 7919);
-            const dayFactor = 0.8 + dayRandGen() * 0.4; // 0.8–1.2
+            const dayFactor = 0.92 + dayRandGen() * 0.16; // 0.92–1.08
             const dailyKWh = baseDailyKWh * dayFactor;
 
             const vals = makeSLPValues(
@@ -385,8 +376,8 @@ function MSCONSGenerator() {
             const content = buildMSCONS({
               malo: cfg.malo,
               obis: "1.8.0",
-              start: start,
-              end: end,
+              start,
+              end,
               values: vals,
             });
             const name =
@@ -401,20 +392,15 @@ function MSCONSGenerator() {
               "_" +
               cfg.malo +
               "_VERBRAUCH.txt";
-            allFiles.push({ malo: cfg.malo, name: name, content: content });
+            allFiles.push({ malo: cfg.malo, name, content });
           } else {
             const dayScale = pvDayScales[d];
-            const vals = makePVProfile(
-              96,
-              cfg.pvPeakKW,
-              seedBase + 33 + d,
-              dayScale
-            );
+            const vals = makePVProfile(96, cfg.pvPeakKW, seedBase + 33 + d, dayScale);
             const content = buildMSCONS({
               malo: cfg.malo,
               obis: "2.8.0",
-              start: start,
-              end: end,
+              start,
+              end,
               values: vals,
             });
             const name =
@@ -429,15 +415,12 @@ function MSCONSGenerator() {
               "_" +
               cfg.malo +
               "_ERZEUGUNG.txt";
-            allFiles.push({ malo: cfg.malo, name: name, content: content });
+            allFiles.push({ malo: cfg.malo, name, content });
           }
         }
       });
 
-      const approxBytes = allFiles.reduce(
-        (sum, f) => sum + f.content.length,
-        0
-      );
+      const approxBytes = allFiles.reduce((sum, f) => sum + f.content.length, 0);
       const limitBytes = LIMIT_MB * 1024 * 1024;
       if (approxBytes > limitBytes) {
         const proceed = window.confirm(
@@ -448,7 +431,6 @@ function MSCONSGenerator() {
             " MB). Continue?"
         );
         if (!proceed) {
-          setIsGenerating(false);
           return;
         }
       }
@@ -479,12 +461,11 @@ function MSCONSGenerator() {
 
       const links = [
         { name: masterName, href: URL.createObjectURL(masterBlob) },
-      ].concat(
-        perMaLoZipBlobs.map((z) => ({
+        ...perMaLoZipBlobs.map((z) => ({
           name: z.name,
           href: URL.createObjectURL(z.blob),
-        }))
-      );
+        })),
+      ];
       setFallbackLinks(links);
     } finally {
       setIsGenerating(false);
@@ -523,13 +504,13 @@ function MSCONSGenerator() {
     const txt = buildMSCONS({
       malo: "99999999999",
       obis: "1.8.0",
-      start: start,
-      end: end,
+      start,
+      end,
       values: valsH0,
     });
     results.push({
       name: "Starts with UNA then UNB (packed)",
-      pass: txt.indexOf("UNA:+.? 'UNB+") === 0,
+      pass: txt.startsWith("UNA:+.? 'UNB+"),
     });
     results.push({
       name: "No newlines present",
@@ -537,26 +518,25 @@ function MSCONSGenerator() {
     });
     results.push({
       name: "Has UNT and UNZ",
-      pass: txt.indexOf("UNT+") !== -1 && txt.indexOf("UNZ+1+") !== -1,
+      pass: txt.includes("UNT+") && txt.includes("UNZ+1+"),
     });
     results.push({
       name: "Has 96×QTY",
       pass: (txt.match(/QTY\+220:/g) || []).length === 96,
-      info:
-        "found " + (txt.match(/QTY\+220:/g) || []).length.toString(),
+      info: "found " + ((txt.match(/QTY\+220:/g) || []).length),
     });
 
     const genVals = makePVProfile(96, 5, 321, 1.0);
     const txtGen = buildMSCONS({
       malo: "99999999999",
       obis: "2.8.0",
-      start: start,
-      end: end,
+      start,
+      end,
       values: genVals,
     });
     results.push({
       name: "[2.8.0] Starts with UNA then UNB (packed)",
-      pass: txtGen.indexOf("UNA:+.? 'UNB+") === 0,
+      pass: txtGen.startsWith("UNA:+.? 'UNB+"),
     });
     results.push({
       name: "[2.8.0] No newlines present",
@@ -564,9 +544,7 @@ function MSCONSGenerator() {
     });
     results.push({
       name: "[2.8.0] Has UNT and UNZ",
-      pass:
-        txtGen.indexOf("UNT+") !== -1 &&
-        txtGen.indexOf("UNZ+1+") !== -1,
+      pass: txtGen.includes("UNT+") && txtGen.includes("UNZ+1+"),
     });
     results.push({
       name: "[2.8.0] Has 96×QTY",
@@ -617,9 +595,7 @@ function MSCONSGenerator() {
     do {
       id =
         "5" +
-        Math.floor(
-          1000000000 + Math.random() * 9000000000
-        ).toString();
+        Math.floor(1_000_000_000 + Math.random() * 9_000_000_000).toString();
     } while (existing.has(id));
 
     let baseCfg;
@@ -650,27 +626,45 @@ function MSCONSGenerator() {
     }
 
     setRawMalos((prev) => (prev ? prev + "\n" + id : id));
-    setConfigs((prev) => prev.concat([baseCfg]));
+    setConfigs((prev) => prev.concat(baseCfg));
   }
 
-  // Optional: Recharts aus globalem Namespace holen, falls vorhanden
-  const Recharts = window.Recharts || {};
-  const LineChart = Recharts.LineChart;
-  const Line = Recharts.Line;
-  const XAxis = Recharts.XAxis;
-  const YAxis = Recharts.YAxis;
-  const CartesianGrid = Recharts.CartesianGrid;
-  const Tooltip = Recharts.Tooltip;
-  const ResponsiveContainer = Recharts.ResponsiveContainer;
-
   return (
-    <div className="app-wrapper" style={{ fontFamily: "system-ui, sans-serif", padding: "24px", maxWidth: "1200px", margin: "0 auto" }}>
-      {/* Header */}
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "16px" }}>
-        <div>
-          <h1 style={{ fontSize: "24px", margin: 0 }}>MSCONS Generator</h1>
-          <div style={{ fontSize: "11px", color: "#6b7280", marginTop: "4px", display: "flex", gap: "8px", alignItems: "center" }}>
-            <span style={{ border: "1px solid #d1d5db", borderRadius: "999px", padding: "2px 8px" }}>
+    <div
+      className="app-root"
+      style={{
+        fontFamily: "system-ui, sans-serif",
+        padding: "24px",
+        maxWidth: "1100px",
+        margin: "0 auto",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          gap: "12px",
+          marginBottom: "16px",
+        }}
+      >
+        <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+          <div style={{ fontSize: "20px", fontWeight: 600 }}>MSCONS Generator</div>
+          <div
+            style={{
+              fontSize: "11px",
+              color: "#6b7280",
+              display: "flex",
+              alignItems: "center",
+              gap: "8px",
+            }}
+          >
+            <span
+              style={{
+                border: "1px solid #d1d5db",
+                borderRadius: "999px",
+                padding: "2px 8px",
+              }}
+            >
               Version {APP_VERSION}
             </span>
             <span>Multi-MaLo · 15-min · Demo-Daten</span>
@@ -678,62 +672,118 @@ function MSCONSGenerator() {
         </div>
       </div>
 
-      {/* Zeitraum & MaLo */}
-      <div style={{ background: "white", borderRadius: "12px", border: "1px solid #e5e7eb", padding: "16px", marginBottom: "16px" }}>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(220px,1fr))", gap: "12px" }}>
+      {/* Zeitraum, MaLos, Presets */}
+      <div
+        style={{
+          border: "1px solid #e5e7eb",
+          borderRadius: "12px",
+          padding: "16px",
+          marginBottom: "16px",
+        }}
+      >
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+            gap: "12px",
+          }}
+        >
           <div>
-            <label style={{ fontSize: "12px", display: "block", marginBottom: "4px" }}>Startdatum (ohne Zeit)</label>
+            <label
+              style={{ fontSize: "12px", display: "block", marginBottom: "4px" }}
+            >
+              Startdatum (ohne Zeit)
+            </label>
             <input
               type="date"
               value={date}
               onChange={(e) => setDate(e.target.value)}
-              style={{ width: "100%", padding: "6px 8px", borderRadius: "6px", border: "1px solid #d1d5db" }}
+              style={{ width: "100%", padding: "6px 8px" }}
             />
           </div>
           <div>
-            <label style={{ fontSize: "12px", display: "block", marginBottom: "4px" }}>Tage</label>
+            <label
+              style={{ fontSize: "12px", display: "block", marginBottom: "4px" }}
+            >
+              Tage
+            </label>
             <input
               type="number"
-              min={1}
-              max={365}
+              min="1"
+              max="365"
               value={days}
               onChange={(e) =>
                 setDays(parseInt(e.target.value || "1", 10))
               }
-              style={{ width: "100%", padding: "6px 8px", borderRadius: "6px", border: "1px solid #d1d5db" }}
+              style={{ width: "100%", padding: "6px 8px" }}
             />
           </div>
           <div>
-            <label style={{ fontSize: "12px", display: "block", marginBottom: "4px" }}>MaLo-IDs (eine pro Zeile)</label>
+            <label
+              style={{ fontSize: "12px", display: "block", marginBottom: "4px" }}
+            >
+              MaLo-IDs (eine pro Zeile)
+            </label>
             <textarea
-              rows={4}
+              rows="4"
               value={rawMalos}
               onChange={(e) => setRawMalos(e.target.value)}
-              style={{ width: "100%", padding: "6px 8px", borderRadius: "6px", border: "1px solid #d1d5db", resize: "vertical" }}
+              style={{
+                width: "100%",
+                padding: "6px 8px",
+                resize: "vertical",
+              }}
             />
           </div>
         </div>
 
-        <div style={{ marginTop: "8px", fontSize: "11px", display: "flex", flexWrap: "wrap", gap: "6px", alignItems: "center" }}>
+        <div
+          style={{
+            marginTop: "12px",
+            fontSize: "12px",
+            display: "flex",
+            flexWrap: "wrap",
+            gap: "8px",
+            alignItems: "center",
+          }}
+        >
           <span style={{ color: "#6b7280" }}>Schnell-Presets:</span>
           <button
             type="button"
             onClick={() => addPreset("H0")}
-            style={{ fontSize: "11px", padding: "3px 8px", borderRadius: "999px", border: "1px solid #d1d5db", background: "white", cursor: "pointer" }}
+            style={{
+              padding: "4px 8px",
+              borderRadius: "999px",
+              border: "1px solid #d1d5db",
+              background: "white",
+              cursor: "pointer",
+            }}
           >
             H0 Haushalt ~3.500 kWh
           </button>
           <button
             type="button"
             onClick={() => addPreset("G0")}
-            style={{ fontSize: "11px", padding: "3px 8px", borderRadius: "999px", border: "1px solid #d1d5db", background: "white", cursor: "pointer" }}
+            style={{
+              padding: "4px 8px",
+              borderRadius: "999px",
+              border: "1px solid #d1d5db",
+              background: "white",
+              cursor: "pointer",
+            }}
           >
             G0 Gewerbe ~30.000 kWh
           </button>
           <button
             type="button"
             onClick={() => addPreset("PV")}
-            style={{ fontSize: "11px", padding: "3px 8px", borderRadius: "999px", border: "1px solid #d1d5db", background: "white", cursor: "pointer" }}
+            style={{
+              padding: "4px 8px",
+              borderRadius: "999px",
+              border: "1px solid #d1d5db",
+              background: "white",
+              cursor: "pointer",
+            }}
           >
             PV ~5 kWp
           </button>
@@ -741,22 +791,37 @@ function MSCONSGenerator() {
       </div>
 
       {/* Pro-MaLo Einstellungen */}
-      <div style={{ background: "white", borderRadius: "12px", border: "1px solid #e5e7eb", padding: "16px", marginBottom: "16px" }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
-          <div style={{ fontSize: "14px", fontWeight: 500 }}>Pro-MaLo Einstellungen</div>
+      <div
+        style={{
+          border: "1px solid #e5e7eb",
+          borderRadius: "12px",
+          padding: "16px",
+          marginBottom: "16px",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            marginBottom: "8px",
+          }}
+        >
+          <div style={{ fontSize: "13px", fontWeight: 500 }}>
+            Pro-MaLo Einstellungen
+          </div>
           <div style={{ fontSize: "11px", color: "#6b7280" }}>
-            PV-Wetter &amp; Tagesform gelten immer für alle Erzeuger, die im selben Schritt generiert werden.
+            PV-Wetter &amp; Tagesform gelten immer für alle Erzeuger, die im
+            selben Schritt generiert werden.
           </div>
         </div>
 
         <div
           style={{
             display: "grid",
-            gridTemplateColumns: "repeat(7,minmax(0,1fr))",
-            gap: "4px",
+            gridTemplateColumns: "repeat(7, minmax(0, 1fr))",
+            gap: "6px",
             fontSize: "12px",
             fontWeight: 500,
-            marginBottom: "4px",
           }}
         >
           <div>MaLo</div>
@@ -768,27 +833,28 @@ function MSCONSGenerator() {
           <div>Info</div>
         </div>
 
-        <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+        <div style={{ marginTop: "4px" }}>
           {configs.map((c) => (
             <div
               key={c.malo}
               style={{
                 display: "grid",
-                gridTemplateColumns: "repeat(7,minmax(0,1fr))",
-                gap: "4px",
+                gridTemplateColumns: "repeat(7, minmax(0, 1fr))",
+                gap: "6px",
                 alignItems: "center",
+                marginTop: "4px",
               }}
             >
               <input
                 value={c.malo}
                 onChange={(e) => updateCfg(c.malo, { malo: e.target.value })}
-                style={{ padding: "4px 6px", borderRadius: "6px", border: "1px solid #d1d5db", fontSize: "12px" }}
+                style={{ padding: "4px 6px" }}
               />
 
               <select
                 value={c.direction}
                 onChange={(e) => updateCfg(c.malo, { direction: e.target.value })}
-                style={{ padding: "4px 6px", borderRadius: "6px", border: "1px solid #d1d5db", fontSize: "12px" }}
+                style={{ padding: "4px 6px" }}
               >
                 <option value="consumption">Verbrauch (1.8.0)</option>
                 <option value="generation">Erzeugung (2.8.0)</option>
@@ -798,7 +864,7 @@ function MSCONSGenerator() {
                 value={c.slp}
                 onChange={(e) => updateCfg(c.malo, { slp: e.target.value })}
                 disabled={c.direction !== "consumption"}
-                style={{ padding: "4px 6px", borderRadius: "6px", border: "1px solid #d1d5db", fontSize: "12px" }}
+                style={{ padding: "4px 6px" }}
               >
                 <option value="H0">H0</option>
                 <option value="G0">G0</option>
@@ -807,8 +873,7 @@ function MSCONSGenerator() {
 
               <input
                 type="number"
-                min={0}
-                step="1"
+                min="0"
                 value={c.expectedAnnualKWh}
                 onChange={(e) =>
                   updateCfg(c.malo, {
@@ -816,12 +881,12 @@ function MSCONSGenerator() {
                   })
                 }
                 disabled={c.direction !== "consumption"}
-                style={{ padding: "4px 6px", borderRadius: "6px", border: "1px solid #d1d5db", fontSize: "12px" }}
+                style={{ padding: "4px 6px" }}
               />
 
               <input
                 type="number"
-                min={0}
+                min="0"
                 step="0.1"
                 value={c.pvPeakKW}
                 onChange={(e) =>
@@ -830,7 +895,7 @@ function MSCONSGenerator() {
                   })
                 }
                 disabled={c.direction !== "generation"}
-                style={{ padding: "4px 6px", borderRadius: "6px", border: "1px solid #d1d5db", fontSize: "12px" }}
+                style={{ padding: "4px 6px" }}
               />
 
               <div style={{ fontSize: "12px", color: "#6b7280" }}>{days}</div>
@@ -844,16 +909,30 @@ function MSCONSGenerator() {
           ))}
         </div>
 
-        <div style={{ marginTop: "8px", fontSize: "11px", color: "#6b7280" }}>
-          Zufällige Abweichungen je Intervall; tägliche Summe wird auf Ziel-kWh normalisiert.
-          Verbrauch nutzt H0/G0/L0-SLP, PV basiert auf kWp, Saison &amp; Wetter.
+        <div style={{ fontSize: "11px", color: "#6b7280", marginTop: "6px" }}>
+          Zufällige Abweichungen je Intervall; tägliche Summe wird auf Ziel-kWh
+          normalisiert. Verbrauch nutzt H0/G0/L0-SLP, PV basiert auf kWp, Saison
+          &amp; Wetter.
         </div>
       </div>
 
-      {/* Preview Chart (wenn Recharts vorhanden) */}
-      <div style={{ background: "white", borderRadius: "12px", border: "1px solid #e5e7eb", padding: "16px", marginBottom: "16px" }}>
-        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "8px" }}>
-          <div style={{ fontSize: "14px", fontWeight: 500 }}>
+      {/* Preview */}
+      <div
+        style={{
+          border: "1px solid #e5e7eb",
+          borderRadius: "12px",
+          padding: "16px",
+          marginBottom: "16px",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            marginBottom: "8px",
+          }}
+        >
+          <div style={{ fontSize: "13px", fontWeight: 500 }}>
             Vorschau: Tagesenergie (erste MaLo)
           </div>
           <div style={{ fontSize: "11px", color: "#6b7280" }}>
@@ -866,7 +945,6 @@ function MSCONSGenerator() {
               : "Keine MaLo konfiguriert"}
           </div>
         </div>
-
         {previewData.length > 0 && LineChart ? (
           <div style={{ height: "260px" }}>
             <ResponsiveContainer width="100%" height="100%">
@@ -874,11 +952,7 @@ function MSCONSGenerator() {
                 <CartesianGrid strokeDasharray="3 3" />
                 <XAxis dataKey="dayLabel" />
                 <YAxis
-                  label={{
-                    value: "kWh/Tag",
-                    angle: -90,
-                    position: "insideLeft",
-                  }}
+                  label={{ value: "kWh/Tag", angle: -90, position: "insideLeft" }}
                 />
                 <Tooltip />
                 <Line
@@ -891,29 +965,53 @@ function MSCONSGenerator() {
               </LineChart>
             </ResponsiveContainer>
           </div>
+        ) : previewData.length > 0 ? (
+          <div style={{ fontSize: "12px", color: "#6b7280" }}>
+            Recharts ist nicht geladen – einfache Vorschau:
+            <ul>
+              {previewData.map((p, idx) => (
+                <li key={idx}>
+                  {p.dayLabel}: {p.kWh} kWh
+                </li>
+              ))}
+            </ul>
+          </div>
         ) : (
           <div style={{ fontSize: "12px", color: "#6b7280" }}>
-            {previewData.length === 0
-              ? "Bitte mindestens eine MaLo konfigurieren, um eine Vorschau zu sehen."
-              : "Recharts ist nicht geladen – die Vorschau-Grafik wird nur angezeigt, wenn die Recharts-Bibliothek eingebunden ist."}
+            Bitte mindestens eine MaLo konfigurieren, um eine Vorschau zu sehen.
           </div>
         )}
       </div>
 
       {/* Generate */}
-      <div style={{ background: "white", borderRadius: "12px", border: "1px solid #e5e7eb", padding: "16px", marginBottom: "16px" }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "12px" }}>
+      <div
+        style={{
+          border: "1px solid #e5e7eb",
+          borderRadius: "12px",
+          padding: "16px",
+          marginBottom: "16px",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            gap: "12px",
+          }}
+        >
           <button
             onClick={handleGenerateZip}
             disabled={isGenerating || configs.length === 0}
             style={{
               padding: "8px 14px",
-              borderRadius: "999px",
+              borderRadius: "8px",
               border: "none",
-              background: isGenerating || configs.length === 0 ? "#9ca3af" : "#0f766e",
+              background: isGenerating ? "#9ca3af" : "#0f766e",
               color: "white",
+              cursor:
+                isGenerating || configs.length === 0 ? "default" : "pointer",
               fontSize: "14px",
-              cursor: isGenerating || configs.length === 0 ? "default" : "pointer",
               display: "flex",
               alignItems: "center",
               gap: "6px",
@@ -921,28 +1019,44 @@ function MSCONSGenerator() {
           >
             {isGenerating ? "Wird generiert …" : "ZIP erzeugen & herunterladen"}
           </button>
-          <div style={{ fontSize: "11px", color: "#6b7280", textAlign: "right" }}>
-            {stats.fileCount > 0 &&
-              "Voraussichtlich " +
-                stats.fileCount +
-                " Dateien (~" +
-                stats.estimatedMb.toFixed(2) +
-                " MB)"}
+          <div
+            style={{
+              fontSize: "11px",
+              color: "#6b7280",
+              textAlign: "right",
+            }}
+          >
+            {stats.fileCount > 0 && (
+              <>
+                Voraussichtlich {stats.fileCount} Dateien (~
+                {stats.estimatedMb.toFixed(2)} MB)
+              </>
+            )}
           </div>
         </div>
 
         {fallbackLinks.length > 0 && (
-          <div style={{ marginTop: "8px" }}>
+          <div style={{ marginTop: "12px" }}>
             <div style={{ fontSize: "13px", marginBottom: "4px" }}>
               Falls der Browser den ZIP-Download blockt: Einzellinks
             </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: "2px", fontSize: "12px" }}>
+            <div
+              style={{
+                fontSize: "12px",
+                display: "grid",
+                gap: "2px",
+              }}
+            >
               {fallbackLinks.map((f, i) => (
                 <a
                   key={i}
                   href={f.href}
                   download={f.name}
-                  style={{ color: "#2563eb", textDecoration: "underline", wordBreak: "break-all" }}
+                  style={{
+                    color: "#2563eb",
+                    textDecoration: "underline",
+                    wordBreak: "break-all",
+                  }}
                 >
                   {f.name}
                 </a>
@@ -952,15 +1066,28 @@ function MSCONSGenerator() {
         )}
       </div>
 
-      {/* Self Tests */}
-      <div style={{ background: "white", borderRadius: "12px", border: "1px solid #e5e7eb", padding: "16px", marginBottom: "16px" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "8px" }}>
+      {/* Self-Tests */}
+      <div
+        style={{
+          border: "1px solid #e5e7eb",
+          borderRadius: "12px",
+          padding: "16px",
+          marginBottom: "12px",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+            marginBottom: "8px",
+          }}
+        >
           <button
-            type="button"
             onClick={runSelfTests}
             style={{
               padding: "6px 10px",
-              borderRadius: "999px",
+              borderRadius: "8px",
               border: "1px solid #d1d5db",
               background: "white",
               cursor: "pointer",
@@ -969,45 +1096,44 @@ function MSCONSGenerator() {
           >
             Self-Checks durchführen
           </button>
-          <span style={{ fontSize: "13px", color: "#6b7280" }}>
+          <span style={{ fontSize: "12px", color: "#6b7280" }}>
             (Regex-Split, 96×QTY, UNA/UNB, Summe≈kWh)
           </span>
         </div>
-
         {tests.length > 0 && (
-          <ul style={{ listStyle: "none", padding: 0, margin: 0, fontSize: "13px" }}>
+          <ul style={{ fontSize: "12px", margin: 0, paddingLeft: "16px" }}>
             {tests.map((t, i) => (
-              <li key={i} style={{ display: "flex", gap: "6px", alignItems: "center", marginBottom: "2px" }}>
-                <span style={{ fontWeight: 600, color: t.pass ? "#16a34a" : "#dc2626" }}>
-                  {t.pass ? "✓" : "✗"}
-                </span>
-                <span>
-                  {t.name}
-                  {t.info ? " – " + t.info : ""}
-                </span>
+              <li key={i}>
+                {t.pass ? "✅" : "❌"} {t.name}
+                {t.info ? " – " + t.info : ""}
               </li>
             ))}
           </ul>
         )}
       </div>
 
-      <div style={{ fontSize: "11px", color: "#6b7280", display: "flex", flexDirection: "column", gap: "2px" }}>
+      <div style={{ fontSize: "11px", color: "#6b7280" }}>
         <div>
-          Format: UNA vorhanden, UNB direkt anschließend, keine Zeilenumbrüche zwischen Segmenten, UNT korrekt gezählt. 15-Min-Intervalle (DTM 163/164) über den gewählten Zeitraum.
+          Format: UNA vorhanden, UNB direkt anschließend, keine Zeilenumbrüche
+          zwischen Segmenten, UNT korrekt gezählt. 15-Min-Intervalle
+          (DTM 163/164) über den gewählten Zeitraum.
         </div>
         <div>
-          Hinweis: Nur Erzeuger, die im selben Generierungslauf erstellt werden, teilen sich exakt dieselben Wetter- &amp; Saisonfaktoren (gleiche „Wettertage“ im Monat).
+          Hinweis: Nur Erzeuger, die im selben Generierungslauf erstellt werden,
+          teilen sich exakt dieselben Wetter- &amp; Saisonfaktoren (gleiche
+          „Wettertage“ im Monat).
         </div>
       </div>
     </div>
   );
 }
 
-// Mount React App (React 17 & 18 kompatibel)
+// Mount
 const rootEl = document.getElementById("root");
 if (rootEl) {
-  if (ReactDOM.createRoot) {
-    ReactDOM.createRoot(rootEl).render(<MSCONSGenerator />);
+  const root = ReactDOM.createRoot ? ReactDOM.createRoot(rootEl) : null;
+  if (root) {
+    root.render(<MSCONSGenerator />);
   } else {
     ReactDOM.render(<MSCONSGenerator />, rootEl);
   }
